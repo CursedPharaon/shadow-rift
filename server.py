@@ -11,23 +11,23 @@ from shared import HEROES
 
 SAVE_FILE = "save.json"
 
-# ═══════════════════════════════════════════════
-# ГЛОБАЛЬНОЕ СОСТОЯНИЕ
-# ═══════════════════════════════════════════════
-
-players = {}      # {nick: {password, friends: [], wins, losses, hero: "vermil"}}
-online = {}       # {ws: nick}
-chat_gc = []      # общий чат: [(ник, текст), ...]
-chat_tc = {}      # тим-чаты: {match_id: [(ник, текст), ...]}
-lobbies = {}      # {lobby_id: {"players": [ник, ...], "host": ник, "ready": {ник: bool}, "size": 3, "mode": "3v3"}}
-matches = {}      # {match_id: {"lobby": ..., "state": {...}}}
-player_match = {} # {ник: match_id} — в какой игре сейчас
+players = {}
+online = {}
+chat_gc = []
+chat_tc = {}
+lobbies = {}
+matches = {}
+player_match = {}
+queue = []
 
 
 def save_data():
-    data = {"players": players}
-    with open(SAVE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data = {"players": {k: v for k, v in players.items() if not v.get("is_bot")}}
+    try:
+        with open(SAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[СЕРВЕР] Save error: {e}")
 
 
 def load_data():
@@ -38,7 +38,7 @@ def load_data():
                 data = json.load(f)
             players = data.get("players", {})
         except Exception as e:
-            print(f"[СЕРВЕР] Ошибка загрузки: {e}")
+            print(f"[СЕРВЕР] Load error: {e}")
 
 
 def now():
@@ -47,17 +47,10 @@ def now():
 
 def new_player(nick):
     return {
-        "password": "",
-        "friends": [],
-        "hero": "vermil",
-        "wins": 0,
-        "losses": 0,
+        "password": "", "friends": [], "hero": "vermil",
+        "wins": 0, "losses": 0, "is_bot": False,
     }
 
-
-# ═══════════════════════════════════════════════
-# ОТПРАВКА
-# ═══════════════════════════════════════════════
 
 async def send(ws, msg):
     try:
@@ -78,19 +71,22 @@ async def broadcast(msg, exclude=None):
             await send(w, msg)
 
 
-# ═══════════════════════════════════════════════
-# ЛОББИ
-# ═══════════════════════════════════════════════
+async def broadcast_in_match(mid, msg):
+    match = matches.get(mid)
+    if not match:
+        return
+    for n in match["blue"] + match["red"]:
+        await send_to_nick(n, msg)
+
 
 def lobby_list():
     result = []
     for lid, l in lobbies.items():
         result.append({
-            "id": lid,
-            "host": l["host"],
+            "id": lid, "host": l["host"],
             "players": l["players"],
-            "size": l["size"],
-            "count": len(l["players"]),
+            "picks": l.get("picks", {}),
+            "size": l["size"], "count": len(l["players"]),
         })
     return result
 
@@ -99,28 +95,19 @@ async def lobby_broadcast():
     await broadcast({"type": "lobby_list", "lobbies": lobby_list()})
 
 
-# ═══════════════════════════════════════════════
-# СОЗДАНИЕ ЮНИТА
-# ═══════════════════════════════════════════════
-
 def make_unit(nick, hero_key, team):
     base = HEROES[hero_key]
+    is_bot = players.get(nick, {}).get("is_bot", False)
     return {
-        "nick": nick,
-        "hero": hero_key,
-        "name": base["name"],
-        "team": team,
-        "is_player": True,   # все игроки
+        "nick": nick, "hero": hero_key, "name": base["name"],
+        "team": team, "is_player": not is_bot, "is_bot": is_bot,
         "hp": base["hp"], "max_hp": base["hp"],
         "mp": base["mp"], "max_mp": base["mp"],
         "dmg": base["dmg"],
         "skills": {k: dict(v) for k, v in base["skills"].items()},
-        "line": "start",
-        "cd": {"1": 0, "2": 0, "3": 0},
-        "stunned_until": 0,
-        "alive": True,
-        "running": False,
-        "respawn_at": 0,
+        "line": "start", "cd": {"1": 0, "2": 0, "3": 0},
+        "stunned_until": 0, "alive": True,
+        "running": False, "respawn_at": 0,
     }
 
 
@@ -150,30 +137,19 @@ def make_match_state(blue_nicks, red_nicks):
     return {
         "units": blue_units + red_units,
         "towers": towers,
-        "blue": blue_nicks,
-        "red": red_nicks,
-        "started": now(),
-        "finished": False,
-        "winner": None,
-        "last_tick": now(),
+        "blue": blue_nicks, "red": red_nicks,
+        "started": now(), "finished": False, "winner": None,
     }
 
 
-# ═══════════════════════════════════════════════
-# БОЙ
-# ═══════════════════════════════════════════════
-
 def attack(attacker, target):
     dmg = attacker["dmg"] + random.randint(-10, 10)
-    target["hp"] -= dmg
-    if target["hp"] < 0:
-        target["hp"] = 0
-    return f"{attacker['name']} → {target['name']}: -{dmg} HP ({target['hp']}/{target['max_hp']})"
+    target["hp"] = max(0, target["hp"] - dmg)
+    continue return f"{attacker['name']} → {target['name']}: -{dmg} HP ({target['hp']}/{target['max_hp']})"
 
 
 def cast_skill(attacker, target, skill_key):
     skill = attacker["skills"][skill_key]
-    
     if attacker["mp"] < skill["mp"]:
         return None
     if attacker["cd"][skill_key] > now():
@@ -181,11 +157,8 @@ def cast_skill(attacker, target, skill_key):
     
     attacker["mp"] -= skill["mp"]
     attacker["cd"][skill_key] = now() + skill["cd"]
-    
     dmg = skill["dmg"] + random.randint(-15, 15)
-    target["hp"] -= dmg
-    if target["hp"] < 0:
-        target["hp"] = 0
+    target["hp"] = max(0, target["hp"] - dmg)
     
     text = f"⚡ {attacker['name']} {skill['name']} → {target['name']}: -{dmg} HP ({target['hp']}/{target['max_hp']})"
     if "stun" in skill:
@@ -198,12 +171,13 @@ def check_death(unit):
     if unit["hp"] <= 0 and unit["alive"]:
         unit["alive"] = False
         unit["respawn_at"] = now() + 10
-        return f"💀 {unit['name']} погиб"
+        return f"💀 {unit['name']
+}            погиб"
     return None
 
 
-def respawn_check(match):
-    for u in match["units"]:
+def resp targetawn_check(match):
+    = for u in match["units targets"]:
         if not u["alive"] and u["respawn_at"] > 0 and now() >= u["respawn_at"]:
             u["alive"] = True
             u["hp"] = u["max_hp"]
@@ -221,7 +195,11 @@ def ai_turn(npc, all_units):
     
     enemy_team = "blue" if npc["team"] == "red" else "red"
     enemies_here = [u for u in all_units if u["alive"] and u["line"] == npc["line"] and u["team"] == enemy_team]
+    
     if not enemies_here:
+        targets = [u for u in all_units if u["alive"] and u["team"] == enemy_team]
+        if targets:
+            npc["line"] = random.choice(["mid", "up", "down"])
         return events
     
     target = min(enemies_here, key=lambda u: u["hp"])
@@ -244,37 +222,34 @@ def ai_turn(npc, all_units):
     return events
 
 
-async def match_tick(match_id):
-    """Каждые 3 секунды — ход ботов (если игроков меньше 3)."""
-    while match_id in matches:
-        await asyncio.sleep(3)
-        match = matches.get(match_id)
+async def match_tick(mid):
+    while mid in matches:
+        await asyncio.sleep(2)
+        match = matches.get(mid)
         if not match or match["finished"]:
             break
         
         respawn_check(match)
         
-        # боты-союзники и враги (если <3 живых игроков)
-        # пока упрощённо — не добавляем ботов, ждём игроков
+        # боты действуют
+        for u in match["units"]:
+            if u.get("is_bot") and u["alive"]:
+                for ev in ai_turn(u, match["units"]):
+                    await broadcast_in_match(mid, {"type": "log", "text": ev})
         
         # башни
         for t in match["towers"]:
-            if not t["alive"]:
-                continue
-            if now() - t["last_hit"] < 2:
+            if not t["alive"] or now() - t["last_hit"] < 2:
                 continue
             enemy_team = "red" if t["team"] == "blue" else "blue"
             targets = [u for u in match["units"] if u["alive"] and u["line"] == t["line"] and u["team"] == enemy_team]
             if not targets:
-                continue
-            target = targets[0]
-            target["hp"] -= t["dmg"]
-            if target["hp"] < 0:
-                target["hp"] = 0
+               [0]
+            target["hp"] = max(0, target["hp"] - t["dmg"])
             t["last_hit"] = now()
             d = check_death(target)
             if d:
-                await broadcast_in_match(match_id, {"type": "log", "text": d})
+                await broadcast_in_match(mid, {"type": "log", "text": d})
         
         # победа
         blue_alive = any(u["alive"] or u["respawn_at"] > 0 for u in match["units"] if u["team"] == "blue")
@@ -283,36 +258,27 @@ async def match_tick(match_id):
         if not red_alive:
             match["finished"] = True
             match["winner"] = "blue"
-            await broadcast_in_match(match_id, {"type": "match_end", "winner": "blue"})
-            # статистика
+            await broadcast_in_match(mid, {"type": "match_end", "winner": "blue"})
             for n in match["blue"]:
-                if n in players:
+                if n in players and not players[n].get("is_bot"):
                     players[n]["wins"] += 1
             for n in match["red"]:
-                if n in players:
+                if n in players and not players[n].get("is_bot"):
                     players[n]["losses"] += 1
             save_data()
             break
         if not blue_alive:
             match["finished"] = True
             match["winner"] = "red"
-            await broadcast_in_match(match_id, {"type": "match_end", "winner": "red"})
+            await broadcast_in_match(mid, {"type": "match_end", "winner": "red"})
             for n in match["red"]:
-                if n in players:
+                if n in players and not players[n].get("is_bot"):
                     players[n]["wins"] += 1
             for n in match["blue"]:
-                if n in players:
+                if n in players and not players[n].get("is_bot"):
                     players[n]["losses"] += 1
             save_data()
             break
-
-
-async def broadcast_in_match(match_id, msg):
-    match = matches.get(match_id)
-    if not match:
-        return
-    for nick in match["blue"] + match["red"]:
-        await send_to_nick(nick, msg)
 
 
 def find_player_unit(match, nick):
@@ -327,16 +293,62 @@ def enemies_on_line(match, line, my_team):
     return [u for u in match["units"] if u["alive"] and u["line"] == line and u["team"] == enemy_team]
 
 
-# ═══════════════════════════════════════════════
-# ОБРАБОТКА КОМАНД
-# ═══════════════════════════════════════════════
+async def start_match(blue, red):
+    mid = str(random.randint(10000, 99999))
+    matches[mid] = make_match_state(blue, red)
+    for n in blue + red:
+        player_match[n] = mid
+    
+    await broadcast_in_match(mid, {
+        "type": "match_start",
+        "match_id": mid,
+        "blue": blue, "red": red,
+    })
+    asyncio.create_task(match_tick(mid))
+    print(f"[СЕРВЕР] Матч {mid} начался: {blue} vs {red}")
+
+
+def spawn_bots(count):
+    bots = []
+    for _ in range(count):
+        name = f"Bot{random.randint(100, 999)}"
+        while name in players:
+            name = f"Bot{random.randint(100, 999)}"
+        players[name] = new_player(name)
+        players[name]["is_bot"] = True
+        players[name]["hero"] = random.choice(list(HEROES.keys()))
+        bots.append(name)
+    return bots
+
+
+async def queue_timeout(nick):
+    """Если 8 сек никто не присоединился — добиваем ботами."""
+    await asyncio.sleep(8)
+    if nick not in queue:
+        return
+    
+    current = queue[:]
+    del queue[:]
+    
+    # добиваем до 6
+    needed = 6 - len(current)
+    if needed > 0:
+        bots = spawn_bots(needed)
+        current += bots
+    
+    random.shuffle(current)
+    await start_match(current[:3], current[3:])
+
 
 async def handle(ws, nick, data):
-    p = players[nick]
+    p = players.get(nick)
+    if not p:
+        return
+    
     cmd = data.get("cmd")
     match_id = player_match.get(nick)
     
-    # ─── ГЛОБАЛЬНЫЙ ЧАТ ───
+    # ═══ ЧАТЫ ═══
     if cmd == "gc":
         text = str(data.get("text", ""))[:200]
         if text.strip():
@@ -346,43 +358,35 @@ async def handle(ws, nick, data):
             await broadcast({"type": "gc", "from": nick, "text": text})
         return
     
-    # ─── ТИМ-ЧАТ ───
     if cmd == "tc":
         if not match_id:
             await send(ws, {"type": "error", "text": "Ты не в игре"})
             return
         text = str(data.get("text", ""))[:200]
         if text.strip():
-            chat_tc.setdefault(match_id, []).append((nick, text))
-            match = matches[match_id]
+            match = matches.get(match_id)
+            if not match:
+                return
             my_team = "blue" if nick in match["blue"] else "red"
             for n in (match["blue"] if my_team == "blue" else match["red"]):
                 await send_to_nick(n, {"type": "tc", "from": nick, "text": text})
         return
     
-    # ─── ЛИЧКА ───
     if cmd == "pm":
         target = data.get("to")
         text = str(data.get("text", ""))[:200]
-        if target not in players:
-            await send(ws, {"type": "error", "text": "Нет такого игрока"})
-            return
-        await send_to_nick(target, {"type": "pm", "from": nick, "text": text})
-        await send(ws, {"type": "pm", "from": nick, "text": text})
+        if target in players:
+            await send_to_nick_list(target, {"type": "pm", "from": nick, "text": text})
+            await send(ws, {"type": "pm", "from": nick, "text": text})
         return
     
-    # ─── ДРУЗЬЯ ───
+    # ═══ ДРУЗЬЯ ═══
     if cmd == "friend_add":
         target = data.get("nick")
-        if target not in players:
-            await send(ws, {"type": "error", "text": "Нет такого"})
-            return
-        if target in p["friends"]:
-            await send(ws, {"type": "error", "text": "Уже в друзьях"})
-            return
-        p["friends"].append(target)
-        save_data()
-        await send(ws, {"type": "info", "text": f"{target} добавлен в друзья"})
+        if target in players and target not in p["friends"]:
+            p["friends"].append(target)
+            save_data()
+            await send(ws, {"type": "info", "text": f"{target} в друзьях"})
         return
     
     if cmd == "friend_del":
@@ -394,14 +398,11 @@ async def handle(ws, nick, data):
         return
     
     if cmd == "friends":
-        result = []
-        for f in p["friends"]:
-            status = "🟢" if f in online.values() else "⚫"
-            result.append(f"{status} {f}")
-        await send(ws, {"type": "info", "text": "Друзья:\n" + "\n".join(result) if result else "Нет друзей"})
+        result = [f"{'🟢' if f in online.values() else '⚫'} {f}" for f in p["friends"]]
+        await send(ws, {"type": "info", "text": "Друзья:\n" + ("\n".join(result) if result else "Нет")})
         return
     
-    # ─── ВЫБОР ГЕРОЯ ───
+    # ═══ ВЫБОР ГЕРОЯ (вне матча) ═══
     if cmd == "hero":
         hero = data.get("hero")
         if hero in HEROES:
@@ -410,7 +411,29 @@ async def handle(ws, nick, data):
             await send(ws, {"type": "info", "text": f"Герой: {HEROES[hero]['name']}"})
         return
     
-    # ─── ЛОББИ ───
+    # ═══ БЫСТРАЯ ИГРА (С РАНДОМАМИ + БОТАМИ) ═══
+    if cmd == "queue":
+        if nick in player_match:
+            await send(ws, {"type": "error", "text": "Ты в мат.clearче"})
+            return
+        if nick in queue:
+            queue.remove(nick)
+            await send(ws, {"type": "info", "text": "Вышел из очереди"})
+            return
+        
+        queue.append(nick)
+        await send(ws, {"type": "info", "text": f"В очереди: {len(queue)}/6"})
+        
+        if len(queue) >= 6:
+            nicks = queue[:6]
+            del queue[:6]
+            random.shuffle(nicks)
+            await start_match(nicks[:3], nicks[3:])
+        else:
+            asyncio.create_task(queue_timeout(nick))
+        return
+    
+    # ═══ ЛОББИ ═══
     if cmd == "lobby_list":
         await send(ws, {"type": "lobby_list", "lobbies": lobby_list()})
         return
@@ -420,6 +443,7 @@ async def handle(ws, nick, data):
         for lid, l in list(lobbies.items()):
             if nick in l["players"]:
                 l["players"].remove(nick)
+                l["picks"].pop(nick, None)
                 if not l["players"]:
                     del lobbies[lid]
         
@@ -427,7 +451,7 @@ async def handle(ws, nick, data):
         lobbies[lid] = {
             "host": nick,
             "players": [nick],
-            "ready": {nick: False},
+            "picks": {},
             "size": 3,
         }
         await send(ws, {"type": "info", "text": f"Лобби {lid} создано"})
@@ -437,15 +461,14 @@ async def handle(ws, nick, data):
     if cmd == "lobby_join":
         lid = str(data.get("id"))
         if lid not in lobbies:
-            await send(ws, {"type": "error", "text": "Нет такого лобби"})
+            await send(ws, {"type": "error", "text": "Нет лобби"})
             return
         l = lobbies[lid]
         if len(l["players"]) >= l["size"] * 2:
-            await send(ws, {"type": "error", "text": "Лобби полно"})
+            await send(ws, {"type": "error", "text": "Полно"})
             return
         if nick not in l["players"]:
             l["players"].append(nick)
-            l["ready"][nick] = False
         await send(ws, {"type": "info", "text": f"Ты в лобби {lid}"})
         await lobby_broadcast()
         return
@@ -454,23 +477,38 @@ async def handle(ws, nick, data):
         for lid, l in list(lobbies.items()):
             if nick in l["players"]:
                 l["players"].remove(nick)
-                l["ready"].pop(nick, None)
+                l["picks"].pop(nick, None)
                 if not l["players"]:
                     del lobbies[lid]
-                else:
-                    if l["host"] == nick and l["players"]:
-                        l["host"] = l["players"][0]
+                elif l["host"] == nick:
+                    l["host"] = l["players"][0]
                 break
-        await send(ws, {"type": "info", "text": "Ты вышел из лобби"})
+        await send(ws, {"type": "info", "text": "Вышел из лобби"})
         await lobby_broadcast()
         return
     
-    if cmd == "lobby_ready":
+    if cmd == "lobby_pick":
+        hero = data.get("hero")
+        if hero not in HEROES:
+            return
         for lid, l in lobbies.items():
             if nick in l["players"]:
-                l["ready"][nick] = not l["ready"].get(nick, False)
-                await send(ws, {"type": "info", "text": f"Готовность: {l['ready'][nick]}"})
+                l["picks"][nick] = hero
+                p["hero"] = hero
+                await send(ws, {"type": "info", "text": f"Выбран {HEROES[hero]['name']}"})
                 await lobby_broadcast()
+                
+                # все выбрали? старт
+                if len(l["picks"]) == len(l["players"]) and len(l["players"]) >= 2:
+                    # собираем команды
+                    nicks = l["players"][:]
+                    needed = 6 - len(nicks)
+                    bots = spawn_bots(needed) if needed > 0 else []
+                    all_nicks = nicks + bots
+                    random.shuffle(all_nicks)
+                    
+                    del lobbies[lid]
+                    await start_match(all_nicks[:3], all_nicks[3:])
                 break
         return
     
@@ -481,52 +519,27 @@ async def handle(ws, nick, data):
                 lid = _lid
                 break
         if not lid:
-            await send(ws, {"type": "error", "text": "Ты не в лобби"})
+            await send(ws, {"type": "error", "text": "Не в лобби"})
             return
         l = lobbies[lid]
         if l["host"] != nick:
-            await send(ws, {"type": "error", "text": "Ты не хост"})
-            return
-        if len(l["players"]) < 2:
-            await send(ws, {"type": "error", "text": "Нужно минимум 2 игрока"})
-            return
-        if not all(l["ready"].get(n, False) for n in l["players"]):
-            await send(ws, {"type": "error", "text": "Не все готовы"})
+            await send(ws, {"type": "error", "text": "Только хост"})
             return
         
-        # разделяем на команды
-        shuffled = l["players"][:]
-        random.shuffle(shuffled)
-        half = len(shuffled) // 2
-        blue = shuffled[:half]
-        red = shuffled[half:]
-        
-        # если нечётное — один игрок идёт в синюю
-        if len(shuffled) % 2 == 1:
-            blue.append(shuffled[-1])
-        
-        mid = str(random.randint(10000, 99999))
-        matches[mid] = make_match_state(blue, red)
-        for n in blue + red:
-            player_match[n] = mid
+        nicks = l["players"][:]
+        needed = 6 - len(nicks)
+        bots = spawn_bots(needed) if needed > 0 else []
+        all_nicks = nicks + bots
+        random.shuffle(all_nicks)
         
         del lobbies[lid]
-        
-        await broadcast_in_match(mid, {
-            "type": "match_start",
-            "match_id": mid,
-            "blue": blue,
-            "red": red,
-        })
+        await start_match(all_nicks[:3], all_nicks[3:])
         await lobby_broadcast()
-        
-        # запускаем тик
-        asyncio.create_task(match_tick(mid))
         return
     
-    # ─── ИГРОВЫЕ КОМАНДЫ ───
+    # ═══ ИГРОВЫЕ КОМАНДЫ ═══
     if not match_id:
-        await send(ws, {"type": "error", "text": "Ты не в игре"})
+        await send(ws, {"type": "error", "text": "Не в игре"})
         return
     
     match = matches.get(match_id)
@@ -538,7 +551,6 @@ async def handle(ws, nick, data):
     if not unit:
         return
     
-    # ─── ИНФО ───
     if cmd == "st":
         await send(ws, {"type": "state", "data": unit, "match_id": match_id})
         return
@@ -562,16 +574,15 @@ async def handle(ws, nick, data):
         skill_key = str(data.get("skill"))
         enemies_here = enemies_on_line(match, unit["line"], unit["team"])
         if not enemies_here:
-            await send(ws, {"type": "log", "text": "Нет врагов на линии"})
+            await send(ws, {"type": "log", "text": "Нет врагов"})
             return
         
         target = enemies_here[0]
         result = cast_skill(unit, target, skill_key)
         if result:
-            await send(ws, {"type": "log", "text": result})
-            # отправить врагам на линии
             for e in enemies_here:
                 await send_to_nick(e["nick"], {"type": "log", "text": result})
+            await send(ws, {"type": "log", "text": result})
             d = check_death(target)
             if d:
                 await broadcast_in_match(match_id, {"type": "log", "text": d})
@@ -586,10 +597,6 @@ async def handle(ws, nick, data):
         await send(ws, {"type": "log", "text": "🏃 Ты убегаешь"})
         return
 
-
-# ═══════════════════════════════════════════════
-# ПОДКЛЮЧЕНИЕ
-# ═══════════════════════════════════════════════
 
 async def client_handler(ws, path=None):
     nick = None
@@ -618,6 +625,7 @@ async def client_handler(ws, path=None):
         
         await send(ws, {"type": "state_full", "data": players[nick]})
         await send(ws, {"type": "gc_history", "messages": chat_gc[-20:]})
+        await send(ws, {"type": "heroes", "heroes": list(HEROES.keys())})
         await lobby_broadcast()
         
         async for raw in ws:
@@ -636,18 +644,16 @@ async def client_handler(ws, path=None):
             del online[ws]
         if nick:
             print(f"[СЕРВЕР] {nick} отключился")
-            # выкинуть из лобби
+            if nick in queue:
+                queue.remove(nick)
             for lid, l in list(lobbies.items()):
                 if nick in l["players"]:
                     l["players"].remove(nick)
+                    l["picks"].pop(nick, None)
                     if not l["players"]:
                         del lobbies[lid]
             await lobby_broadcast()
 
-
-# ═══════════════════════════════════════════════
-# ЗАПУСК
-# ═══════════════════════════════════════════════
 
 async def main():
     load_data()
